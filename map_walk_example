@@ -1,0 +1,480 @@
+library(vip)
+library(dplyr)
+library(purrr)
+library(yardstick)
+library(dials)
+library(tidyverse)
+library(noctua)
+library(aws.ec2metadata)
+library(aws.s3)
+library(jsonlite)
+###############################################################################
+section("1. DATA LOADING")
+
+
+### Résultats de l'enquête : survey
+load(system.file(file.path("data", "rq.Rdata"), package = "vip"))
+
+
+
+con <- noctua::dbConnect(
+  noctua::athena(),
+  schema_name = config$schema_name,
+  work_group = config$workgroup,
+  s3_staging_dir = config$s3_staging_dir,
+  rstudio_conn_tab = FALSE
+)
+
+noctua::noctua_options(file_parser = "vroom")
+
+bdd_base_clients <- query_cond_filter(con,
+                                      config$base_client_interne,
+                                      columns = unlist(config$base_interne_vars) %>%
+                                        unname()) %>% rename(secteur = marche)
+
+insee_dbo_base_conquete <- query_cond_filter(
+  con = con,
+  table = config$insee_conquete,
+  columns = unlist(config$insee_conquete_vars) %>%
+    unname(),
+  segmentation_ec_dcp %in% c("exclusif E&C", "zone grise")
+)
+
+insee_dbo_entreprise <- query_cond_filter(
+  con = con,
+  table = config$insee_entreprise,
+  columns = unlist(config$insee_entreprise_vars) %>%
+    unname()
+)
+
+message("End of Data loading")
+
+tarif <- insee_dbo_base_conquete %>%
+  dplyr::mutate(tarif_siret = dplyr::if_else(
+    !is.na(!!rlang::sym(config$insee_conquete_vars$tarif_elec)),
+    !!rlang::sym(config$insee_conquete_vars$tarif_elec),
+    !!rlang::sym(config$insee_conquete_vars$tarif_elec_estime)
+  )) %>%
+  dplyr::select(siren, tarif_siret) %>%
+  dplyr::filter(!is.na(tarif_siret)) %>%
+  dplyr::group_by(siren) %>%
+  dplyr::mutate(
+    nb_couleur = n_distinct(tarif_siret),
+    tarif_siren = dplyr::if_else(nb_couleur > 1,
+                                 "Plusieurs couleurs",
+                                 tarif_siret)
+  ) %>%
+  dplyr::distinct(siren, tarif_siren)
+
+message("Information sur le tarif synthétisée")
+
+perim_gaz <- insee_dbo_base_conquete %>%
+  dplyr::left_join(bdd_base_clients, by = config$gaz$siren) %>%
+  dplyr::mutate(utilise_gaz_siret = dplyr::case_when(
+    (config$gaz$flag_gaz == 1) |
+      (config$gaz$client %in% c("Dual", "Gaz")) |
+      (config$gaz$contrat > 0) ~ 1,
+    TRUE ~ 0
+  )) %>%
+  dplyr::select(siren, utilise_gaz_siret) %>%
+  filter(!is.na(utilise_gaz_siret)) %>%
+  dplyr::group_by(siren) %>%
+  dplyr::mutate(
+    nb_siret = n_distinct(utilise_gaz_siret),
+    utilise_gaz_siren = dplyr::if_else(nb_siret > 1, 1, utilise_gaz_siret)
+  ) %>%
+  dplyr::distinct(siren, utilise_gaz_siren)
+
+message("Data sur le gaz synthétisées")
+
+# Data analysis
+###############################################################################
+section("2. DATA ANALYSIS : CLIENTS BASE")
+message("DATA ANALYSIS : STAT OF NA and EMPTY CELLS")
+
+### bdd_base_clients
+message(empty_data_stat(bdd_base_clients, "clients base"))
+
+# Data processing
+###############################################################################
+
+section("3. DATA PROCESSING  : CLIENTS BASE")
+
+message("MODALITIES : CLIENTS BASE")
+
+bdd_clients <- bdd_base_clients %>%
+  mutate(volume_annuel_actif_elec = rowSums(bdd_base_clients[, config$volume_elec])) %>% #####creation d'actif_elec
+  dplyr::distinct(siren, .keep_all = T)
+
+bdd_clients <- bdd_clients %>%  mutate(
+  couleur_elec = case_when(
+    (volume_annuel_actif_tlv != 0 & volume_annuel_actif_jaune != 0) |
+      (volume_annuel_actif_tlv != 0 &
+         volume_annuel_actif_bleu != 0) |
+      (volume_annuel_actif_tlv != 0 &
+         volume_annuel_actif_vert != 0) |
+      (volume_annuel_actif_jaune != 0 &
+         volume_annuel_actif_vert != 0) |
+      (volume_annuel_actif_jaune != 0 &
+         volume_annuel_actif_bleu != 0) |
+      (volume_annuel_actif_vert != 0 &
+         volume_annuel_actif_bleu != 0) ~ "Plusieurs Couleurs",
+
+    volume_annuel_actif_tlv != 0 ~ "TLV",
+    volume_annuel_actif_vert != 0 ~ "VERT",
+    volume_annuel_actif_jaune != 0 ~ "JAUNE",
+    volume_annuel_actif_bleu != 0 ~ "BLEU"
+  )
+)
+bdd_clients <-
+  bdd_clients %>%  mutate(interaction_site_elec = paste0(tranche_nb_site, "/", couleur_elec))
+
+clients_categorised <-
+  purrr::pmap(list(
+    config$float_to_cat_vars,
+    config$seuils,
+    config$new_modalities_label
+  ),
+  function(x, y, z) {
+    bdd_clients %>%
+      mutate_at(vars(unlist(x)),
+                ~ cut(., breaks = y, labels = z)) %>%
+      select(x)
+
+  })
+
+bdd_clients <- bdd_clients %>%
+  mutate(
+    marge = clients_categorised$marge$marge_annuelle_actif_totale,
+    conso_gaz = clients_categorised$conso_gaz$volume_annuel_actif_gaz,
+    anciennete = clients_categorised$anciennete$anciennete_client_annee
+  )
+
+message("MODALITIES : CLIENTS SURVEY")
+outputs_rq_clients <-
+  dplyr::inner_join(bdd_clients, rq, by = "siren") %>%
+  distinct(siren, .keep_all = T)
+
+
+###############################################################################
+section("4. MODEL : CLIENTS BASE")
+
+train_clients_list <-
+  purrr::map(
+    config$targets,
+    ~ outputs_rq_clients %>%
+      dplyr::rename(criterion = !!rlang::sym(.x)) %>%
+      dplyr::select(config$model_x_vars_clients,
+                    config$model_y_var_clients)
+  ) %>%
+  set_names(config$targets)
+
+message("TRAINING AND PREDICTION : SURVEY CLIENTS")
+
+set.seed(1234)
+client_list <-
+  purrr::map(
+    train_clients_list,
+    ~ set_recipe_and_train(
+      data = .x,
+      prop = 0.7,
+      y = "criterion",
+      engine = "ranger",
+      parsnip_model = "rand_forest" ,
+      trees = 350
+    )
+  )
+kpis_client_list <- purrr::map(client_list,  ~ .$kpi)
+model_client_list <- purrr::map(client_list,  ~ .$model)
+
+message("PREDICTION : CLIENTS BASE")
+
+bdd_clients <- bdd_clients  %>%
+  dplyr::select(config$model_x_vars_clients)
+
+predictions_clients_list <-
+  purrr::map(
+    model_client_list,
+    ~ predict(.x, bdd_clients , type = "prob") %>%
+      dplyr::mutate(class = if_else((.pred_Oui >= 0.5), "Oui", "Non"), proba = .pred_Oui) %>%
+      dplyr::select(proba, class) %>%
+      bind_cols(select(bdd_clients, siren), .)
+  )
+section("5 : SAVING CIENTS PREDICTIONS AND MODEL")
+message("SAVING PREDICTIONS")
+purrr::walk2(
+  predictions_clients_list,
+  names(predictions_clients_list),
+  ~ write(
+    data = .x,
+    FUN = arrow::write_parquet,
+    bucket = config$bucket_output,
+    object = paste0(
+      config$folder_output,
+      glue::glue(
+        config$file_output,
+        type = 'clients',
+        target = .y,
+        filename =
+          paste0(config$file_output_name$clients,
+                 '.parquet')
+      )
+    )
+  )
+)
+
+message(" Save clients model to S3")
+
+file_output_model = paste0(
+  '/type={type}/stage={stage}',
+  '/date=',
+  format(Sys.time(), "%Y%m%d%H%M"),
+  '/target={target}'
+)
+message("Saving client model in the model logs")
+purrr::walk2(
+  model_client_list,
+  names(model_client_list),
+  ~ save_model(
+    model = .x,
+    folder = paste0(
+      config$folder_models,
+      glue::glue(
+        file_output_model,
+        type = 'clients',
+        target = .y,
+        stage = 'clean'
+      )
+    ),
+    bucket = config$bucket_models
+    ,
+    multipart = TRUE
+  )
+)
+message("Saving client model as  current client model")
+
+purrr::walk2(
+  model_client_list,
+  names(model_client_list),
+  ~ save_model(
+    model = .x,
+    folder = paste0(
+      config$folder_models,
+      glue::glue(
+        paste0('/type={type}', '/stage={stage}',
+               '/target={target}'),
+        type = 'clients',
+        target = .y,
+        stage = 'current'
+      )
+    ),
+    bucket = config$bucket_models
+    ,
+    multipart = TRUE
+  )
+)
+rm(model_client_list, predictions_clients_list)
+
+section("6 : PROSPECTS  PROCESSING")
+
+table <- insee_dbo_entreprise %>%
+  inner_join(bdd_base_clients, by = "siren") %>%
+  distinct(activiteprincipaleunitelegale, secteur_activite)
+
+bdd_prospects <- insee_dbo_base_conquete %>%
+  dplyr::left_join(., insee_dbo_entreprise, by = "siren") %>%
+  dplyr::inner_join(., table, by = 'activiteprincipaleunitelegale') %>%
+  dplyr::select(!!unlist(config$insee_entreprise_vars), secteur_activite) %>%
+  dplyr::left_join(tarif, by = "siren") %>%
+  dplyr::left_join(perim_gaz, by = "siren") %>%
+  dplyr::distinct(siren, .keep_all = T)
+
+
+bdd_prospects_train <- bdd_prospects %>%
+  dplyr::inner_join(rq, by = "siren")
+
+if (length(unique(bdd_prospects$siren)) != nrow(bdd_prospects))
+  warning("Il y a des SIREN en double")
+
+section("6. DATA ANALYSIS : PROSPECTS BASE")
+message("DATA ANALYSIS : STAT OF NA and EMPTY CELLS")
+message(empty_data_stat(bdd_prospects_train, "prospects_train"))
+
+section("7. MODEL : PROSPECTS")
+
+train_prospects_list <-
+  purrr::map(
+    config$targets,
+    ~ bdd_prospects_train %>%
+      dplyr::rename(criterion = !!rlang::sym(.x)) %>%
+      select(config$model_x_vars_prospects, config$model_y_var_prospects)
+  ) %>%
+  set_names(config$targets)
+
+
+prospects_list <-
+  purrr::map(
+    train_prospects_list,
+    ~ set_recipe_and_train(
+      data = .x,
+      prop = 0.7,
+      y = config$model_y_var_prospects,
+      engine = "kernlab",
+      parsnip_model = "svm" ,
+      cost = 100,
+      degree = 1,
+      scale_factor = 40,
+      margin = 1
+    )
+  )
+kpis_prospects_list <- purrr::map(prospects_list,  ~ .$kpi)
+model_prospects_list <- purrr::map(prospects_list,  ~ .$model)
+
+bdd_prospects <- bdd_prospects  %>%
+  dplyr::select(config$model_x_vars_prospects)
+
+
+predictions_prospects_list  <-
+  purrr::map(
+    model_prospects_list,
+    ~ predict(.x, bdd_prospects , type = "prob") %>%
+      dplyr::mutate(class = if_else((.pred_Oui >= 0.5), "Oui", "Non"), proba = .pred_Oui) %>%
+      dplyr::select(proba, class) %>%
+      bind_cols(select(bdd_prospects, siren), .)
+  )
+
+
+section("8-SAVING CIENTS PREDICTIONS AND MODEL")
+
+purrr::walk2(
+  predictions_prospects_list,
+  names(predictions_prospects_list),
+  ~ write(
+    data = .x,
+    FUN = arrow::write_parquet,
+    bucket = config$bucket_output,
+
+    object = paste0(
+      config$folder_output,
+      glue::glue(
+        config$file_output,
+        type = 'prospects',
+        target = .y,
+        filename =
+          paste0(config$file_output_name$prospects,
+                 '.parquet')
+      )
+    )
+  )
+)
+
+
+
+message(" Save prospects model to S3")
+
+
+message("Saving prospects model in the model logs")
+purrr::walk2(
+  model_prospects_list,
+  names(model_prospects_list),
+  ~ save_model(
+    model = .x,
+    folder = paste0(
+      config$folder_models,
+      glue::glue(
+        file_output_model,
+        type = 'prospects',
+        target = .y,
+        stage = 'clean'
+      )
+    ),
+    bucket = config$bucket_models
+    ,
+    multipart = TRUE
+  )
+)
+message("Saving prospects model as current prospects model")
+purrr::walk2(
+  model_prospects_list,
+  names(model_prospects_list),
+  ~ save_model(
+    model = .x,
+    folder = paste0(
+      config$folder_models,
+      glue::glue(
+        paste0('/type={type}', '/stage={stage}',
+               '/target={target}'),
+        type = 'prospects',
+        target = .y,
+        stage = 'current'
+      )
+    ),
+    bucket = config$bucket_models
+    ,
+    multipart = TRUE
+  )
+)
+
+section("9 - Create Table for results in Athena")
+
+purrr::walk2(
+  config$file_output_name,
+  names(config$file_output_name),
+  ~ from_s3_to_athena(
+    bucket = config$bucket_output,
+    obj = glue::glue(paste0(config$folder_output, '/type={type}'), type = .y),
+    database = config$database,
+    workgroup = config$workgroup,
+    table_name = .x,
+    vars = config$vars_to_athena,
+    partition_vector = config$partition,
+    connection = con
+  )
+)
+
+section("10- Save kpi to S3")
+
+purrr::walk2(
+  kpis_client_list,
+  names(kpis_client_list),
+  ~ jsonlite::toJSON(.x) %>%
+    aws.s3::s3write_using(
+      FUN = jsonlite::write_json,
+      bucket = 'cdh-dsdevkpis-382109',
+      object = glue::glue(
+        paste0(
+          config$folder_kpis,
+          '/',
+          date = format(Sys.time(), "%Y-%m-%d"),
+          '/type={type}',
+          '/target={target}',
+          '/',
+          file = config$file_kpis
+        ),
+        target = .y,
+        type = 'clients'
+      )
+    )
+)
+purrr::walk2(
+  kpis_prospects_list,
+  names(kpis_client_list),
+  ~ jsonlite::toJSON(.x) %>%
+    aws.s3::s3write_using(
+      FUN = jsonlite::write_json,
+      bucket = config$bucket_kpis,
+      object = glue::glue(
+        paste0(
+          config$folder_kpis,
+          '/',
+          date = format(Sys.time(), "%Y-%m-%d"),
+          '/type={type}',
+          '/target={target}',
+          '/',
+          file = config$file_kpis
+        ),
+        target = .y,
+        type = 'prospects'
+      )
+    )
+)
