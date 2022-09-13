@@ -1,0 +1,439 @@
+---
+title: "Dashboard d'analyse Derivx"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme:
+      bg: "#fcfcfc"
+      fg: "#8e868f"
+      primary: "#ED79F9"
+      font_scale: 0.85
+      base_font: !expr bslib::font_google("Prompt")
+      code_font: !expr bslib::font_google("JetBrains Mono")
+    source_code: embed
+
+runtime: shiny
+---
+Suivi de consommation
+===
+
+```{r}
+library(dplyr)
+library(noctua)
+library(purrr)
+library(flexdashboard)
+library(highcharter)
+library(tidyr)
+library(lubridate)
+library(shiny)
+library(bs4Dash)
+#library(aws.s3)
+#library(reshape2)
+library(aws.ec2metadata)
+library(jsonlite)
+library(httr)
+```
+```{r}
+cond_filter <- function(.data, ..., do) {
+  if (do) {
+    filter(.data = .data, ...)
+  } else {
+    return(.data)
+  }
+}
+query_cond_filter <- function(con, table, columns, ...) {
+  table <- dplyr::tbl(con, table) %>%
+    cond_filter(..., do = !purrr::is_empty(list(rlang::quos(...)))) %>%
+    dplyr::select(!!columns) %>%
+    dplyr::collect()
+  return(table)
+}
+con <- noctua::dbConnect(
+  noctua::athena(),
+  schema_name = 'cdh_derivxdev_27035',
+  work_group = 'cdh_derivxdev_27035',
+  s3_staging_dir = 's3://aws-athena-query-results-423183760907-eu-west-1/cdh_derivxdev_27035',
+  rstudio_conn_tab = FALSE
+)
+noctua::noctua_options(file_parser = "vroom")
+```
+
+
+```{r}
+
+list_pdl <- c('30000110285415','30000110323901','30000110351570')
+
+fetch_pdl <- function(id_pdl = '30000110285415', maille = 'weekly'){
+  token_request <- POST("https://engie-ec.oktapreview.com/oauth2/aus1ake7w68UqEvZU0x7/v1/token/",
+                        body = list(grant_type = "client_credentials",scope = 'derivx'),encode = "form",
+                        httr::add_headers(
+                          "Authorization" = "Basic MG9hMWh1anRzaUpETlhlQ0IweDc6Rl83LUFJekFreFNYU3NZNk1jUWozUzhGOGROWlNia200cVFvN19IVQ==",
+                          'cache-control'=' no-cache',
+                          'accept' = ' application/json'), 
+                        httr::content_type("application/x-www-form-urlencoded")) #encode="json"
+  token <- content(token_request)$access_token
+  file <-  POST("https://vpce-05c5f783464c9e3fc-8f70bqsi.execute-api.eu-west-1.vpce.amazonaws.com/dev/derivx", add_headers( 'Authorization' = paste0("Bearer ", token),'host' = 'pominocrki.execute-api.eu-west-1.amazonaws.com'), body = upload_file(paste0("data/",id_pdl,"_",maille,".json"))
+  ) %>% 
+    content()#jsonlite::fromJSON(txt = paste0("pdl_result_",x,".json")  )
+}
+
+date_to_list <- function(x){ c(1:length(x))
+}
+```
+
+
+```{r}
+
+bib <- reactive({
+  req(input$id_prm,input$maille)
+  
+  if (input$maille  == "Hebdomadaire"){
+    data <- fetch_pdl(id_pdl = input$id_prm)
+    data$dates <- unlist(data$dates) %>% as.Date() %>% floor_date(unit= "week",week_start = 1)
+  }
+  else{
+    data <- fetch_pdl(id_pdl = input$id_prm,maille = "monthly")
+    
+    data$dates <- unlist(data$dates) %>%  as.Date() %>% floor_date(unit = "month",week_start = 1)
+    
+  }
+  data$dates <- unique(data$dates)
+  data$`Impact climatique des DJU (kwh)` <- unlist(data$`Impact climatique des DJU (kwh)`)
+  for (i in names(data)){
+    if (typeof(data[[i]]) == "list"){
+      data[[i]] <- unlist(data[[i]])
+    }
+  }
+  data <- as.data.frame(data)
+})
+
+```
+
+
+Column {.tabset data-width=700 }
+------------------------------------------------------------------------
+
+### Consommation
+```{r}
+fluidRow(
+  column(4,selectInput(inputId = 'id_prm',
+                       label = "Selectionner un pdl :",
+                       choices = list_pdl )),
+  
+  column(4,selectInput(inputId = 'maille',
+                       label = "Selectionner une Maille :",
+                       choices = c("Mensuelle", "Hebdomadaire"),selected = "Mensuelle"
+  ))
+  
+)
+observe({
+  req(bib())
+  semaine <-  c(1:length(bib()$dates)) %>% setNames(bib()$dates)
+  updateSelectInput(session , inputId = "week",choices = semaine,selected=tail(semaine,1 ))
+  
+})
+
+output$onglet1 <- highcharter::renderHighchart({
+  req(bib())
+  hc <-  hchart(
+    bib(),
+    type = "spline",
+    hcaes(x = dates, y = Consommations.reelles),
+    name = "Consommation réelle",
+    id = "Consommation réelle", # this is for link the arearange series to this one and have one legend
+    lineWidth = 1,
+    showInLegend = TRUE,
+    color = hex_to_rgba("black",1)
+  ) %>% 
+    hc_add_series(
+      bib(),
+      type = "arearange",
+      name = "Intervalle de consommation",
+      hcaes(x = dates, low = bornes.inf, high = bornes.sup),
+      linkedTo = "Consommation réelle", # here we link the legends in one.
+      showInLegend = FALSE,
+      color = hex_to_rgba("grey", 0.2),  # put a semi transparent color
+      zIndex = -3 # this is for put the series in a back so the points are showed first
+    ) %>%  hc_size(height = 550)
+  hc
+})
+fluidRow(highcharter::highchartOutput("onglet1"))
+
+```
+
+
+
+### Consommation détaillée
+
+```{r}
+
+output$onglet2 <- highcharter::renderHighchart({
+  req(bib(),input$week)
+  week <- as.integer(input$week)
+  data <- bib() %>%  mutate(conso_de_ref = Consommations.predites/(Impact.climatique.des.DJU..kwh.)/(Tendance.de.consommation..kwh.),conso_climat = conso_de_ref*(Impact.climatique.des.DJU..kwh. - 1))
+  
+  
+  hc <-  hchart(
+    data,
+    type = "spline",
+    name = "Tendance de consommation",
+    hcaes(x = dates,y = Tendance.de.consommation..kwh. ),
+    
+    linkedTo = "Consommation réelle", # here we link the legends in one.
+    showInLegend = T,
+    color = hex_to_rgba("blue", 0.5),  # put a semi transparent color
+    zIndex = -3 # this is for put the series in a back so the points are showed first
+  ) %>%  
+    hc_yAxis_multiples(
+      list(lineWidth = 3,
+           title = list(text = "Tendance de consommation"),
+           opposite = F),
+      list(showLastLabel = F, 
+           title = list(text = "Consommation (Kwh)"), 
+           opposite = T)
+    ) %>%
+    hc_add_series(
+      data,
+      type = "spline",
+      name = "Consommation de référence ",
+      hcaes(
+        x = dates,
+        y = conso_de_ref),
+      yAxis = 1,
+      linkedTo = "Consommation de référence", # here we link the legends in one.
+      showInLegend = T,
+      color = hex_to_rgba("black", 1),  
+    ) %>%   
+    hc_add_series(
+      data,
+      type = "spline",
+      name = "Consommation lié au climat",
+      hcaes(x = dates,y = conso_climat),
+      linkedTo = "Consommation réelle", # here we link the legends in one.
+      showInLegend = T,
+      color = hex_to_rgba("red", 0.5),  # put a semi transparent color
+      zIndex = -3, # this is for put the series in a back so the points are showed first
+      yAxis = 1
+    ) %>%
+    hc_size(height = 600) 
+  hc
+})
+fluidRow(column(12,highcharter::highchartOutput("onglet2")))
+
+
+
+```
+
+
+### Information
+```{r}
+
+
+information <- reactive({
+  req(input$id_prm)
+  pdl <- input$id_prm
+  #requete Athena pour side_rubis_portefeuille
+  
+  table <- tbl(con,"siderubis_edm_dbo_dtm_portefeuille_gazelec_edm_current_athena") %>% 
+    select(c('reference_site','raison_sociale_contractante','code_naf_payeuse','code_postal_site')) %>%
+    dplyr::filter(reference_site == pdl) %>% 
+    collect %>% 
+    mutate(naf1 = featurize::decode_sirene_naf(code_naf_payeuse, 1),
+           naf5 = featurize::decode_sirene_naf(code_naf_payeuse, 5),
+           commune = featurize::decode_geo_zip_code(code_postal_site,lvl = 'com'))
+  table
+})
+output$table <- renderTable({
+  information()
+})
+
+output$box <- renderbs4InfoBox(
+  
+  box(title = "Utilisateur",width = 6,
+      boxProfile(
+        image = "https://www.sammobile.com/wp-content/uploads/2017/11/Camel.png", 
+        title = information()$raison_sociale_contractante, 
+        
+        bordered = T,
+        boxProfileItem("Commune",information()$commune),
+        boxProfileItem("PDL : ",input$id_prm),
+        boxProfileItem("Secteur d'activité : ",information()$naf5)
+        
+      )))
+fluidRow(column(12,infoBoxOutput("box")))
+
+
+
+
+
+```
+
+
+Column {.tabset data-width=220}
+------------------------------------------------------------------------
+
+
+
+
+### Barplot  
+```{r}
+
+output$bar2 <- renderHighchart({
+  req(bib())
+  data <- bib()
+  week <- as.integer(input$week)
+  conso_de_ref <- data$Consommations.predites[week]/(data$Impact.climatique.des.DJU..kwh.[week])/(data$Tendance.de.consommation..kwh.[week])
+  conso_climat <- conso_de_ref*(data$Impact.climatique.des.DJU..kwh.[week]-1)
+  
+  effet_cumulatif <- data$Consommations.predites[week] - conso_de_ref - conso_climat - data$Consommations.predites[week]*(data$Tendance.de.consommation..kwh.[week] - 1)
+  conso_de_ref <- conso_de_ref 
+  conso_client <- data$Consommations.reelles[week] - conso_de_ref - conso_climat #+ conso_tendance
+  
+  highchart() %>% 
+    hc_chart(type = "column") %>% 
+    hc_title(text = "Consommation") %>% 
+    hc_plotOptions(column = list(
+      dataLabels = list(enabled = T,
+                        formatter = JS("function(){return Highcharts.numberFormat(this.y,0)+' KWh';}")),
+      stacking = "normal",
+      enableMouseTracking = T)
+    ) %>% 
+    hc_add_series(name = "Usage client ",
+                  data = conso_client,color='red') %>% 
+    hc_add_series(name = "Consommation lié au climat",
+                  data = conso_climat) %>% 
+    hc_add_series(name = "Consommation de référence",
+                  data = conso_de_ref)   %>% 
+    
+    hc_size(height = 550 ) 
+})
+fluidRow(column(12,selectInput(inputId = "week", label = "Semaine à Analyser:",
+                               choices = NULL)),column(12,highchartOutput("bar2")))
+```
+
+### Waterfall
+```{r}
+
+output$waterfall <- renderHighchart({
+  req(bib())
+  data <- bib()
+  week <- as.integer(input$week)
+  conso_de_ref <- data$Consommations.predites[week]/(data$Impact.climatique.des.DJU..kwh.[week])/(data$Tendance.de.consommation..kwh.[week])
+  conso_climat <- conso_de_ref*(data$Impact.climatique.des.DJU..kwh.[week] - 1)
+  effet_cumulatif <- data$Consommations.predites[week] - conso_de_ref - conso_climat - data$Consommations.predites[week]*(data$Tendance.de.consommation..kwh.[week] - 1)
+  conso_de_ref <- conso_de_ref #+ effet_cumulatif
+  conso_client <-  data$Consommations.reelles[week] - conso_de_ref - conso_climat
+  df <- data.frame(name = c("Consommation de référence","Usage client ","Consommation lié au climat"), y = c(conso_de_ref,conso_client,conso_climat), color = c("black","red","blue") )
+  
+  highchart() %>%
+    hc_xAxis(categories = df$name ) %>%
+    
+    hc_tooltip(
+      outside = TRUE
+    ) %>%
+    hc_chart(type = "waterfall") %>%
+    hc_title(text = "Consommation") %>%
+    hc_plotOptions(waterfall = list(
+      dataLabels = list(enabled = T,
+                        formatter = JS("function(){return Highcharts.numberFormat(this.y,0)+' KWh';}")),
+      enableMouseTracking = T)#,isSum=c(FALSE, FALSE, FALSE)
+    )  %>%
+    hc_add_series(
+      showInLegend = T,
+      data = df)  %>%
+    hc_size(height = 600 ) 
+})
+fluidRow(highchartOutput("waterfall"))
+
+```
+
+
+Column {data-width=120}
+------------------------------------------------------------------------
+### Tendance long terme de consommation: { .valuebox}
+```{r}
+flexdashboard::renderValueBox({ 
+  req(bib())
+  x <- tail(bib()$Tendance.de.consommation..kwh., n = 1)-1
+  flexdashboard::valueBox(
+    value = paste0(ifelse(x > 0,"+",""),
+                   format(x*100, big.mark = " ",digits = 2), '%') ,
+    icon = "fa-user",color = ifelse(x < 0,"success","red")
+  )
+})
+```
+
+
+###  { .valuebox}
+```{r}
+flexdashboard::renderValueBox({
+  req(bib())
+  flexdashboard::valueBox(value = tags$p(ifelse(input$maille == "Mensuelle", paste0("Mois de ",bib()$dates[as.integer(input$week)] %>% 
+                                                                                      format("%b %y")), paste0("Semaine du ",bib()$dates[as.integer(input$week)] %>% format("%d %m %y") )),style = ifelse(input$maille == "Mensuelle","font-size: 100%;","font-size: 75%;")),color = "yellow")
+})
+```
+
+
+### Consommation dûe à l'usage client sur la période { .valuebox} 
+
+```{r}
+htmltools::tagList(fontawesome::fa_html_dependency())
+flexdashboard::renderValueBox({
+  week <- as.integer(input$week)
+  req(bib())
+  data <- bib()
+  conso_de_ref <- data$Consommations.predites[week]/(data$Impact.climatique.des.DJU..kwh.[week])/(data$Tendance.de.consommation..kwh.[week])
+  conso_climat <- conso_de_ref*(data$Impact.climatique.des.DJU..kwh.[week] - 1)
+  effet_cumulatif <- data$Consommations.predites[week] - conso_de_ref - conso_climat - data$Consommations.predites[week]*(data$Tendance.de.consommation..kwh.[week] - 1)
+  conso_de_ref <- conso_de_ref #+ effet_cumulatif
+  x <-  data$Consommations.reelles[week] - conso_de_ref - conso_climat
+  flexdashboard::valueBox(
+    value = ifelse(abs(x) > 10000,
+                   format(round(x/1000), big.mark = " ",digits = 0, nsmall = 0) %>%
+                     paste0(' MWh'),
+                   format(x, big.mark = " ",digits = 0, nsmall = 0) %>%
+                     paste0(' KWh')),
+    icon = "fa-user",color = ifelse(x < 0,"success","red")
+  )
+})
+
+```
+
+### Consommation Totale sur la période { .valuebox} 
+
+```{r}
+flexdashboard::renderValueBox({
+  req(bib())
+  week <- as.integer(input$week)
+  data <- bib()$Consommations.reelles[week]
+  flexdashboard::valueBox(
+    value = ifelse(abs(data) > 10000,
+                   format(round(data/1000), big.mark = " ",digits=0) %>%
+                     paste0(' MWh'),
+                   format(round(data), big.mark = " ",digits=0) %>%
+                     paste0(' KWh')),
+    icon = "fa-calculator", color = "info"
+  )
+})
+```
+
+### Consommation liée à la température sur la période { .valuebox}
+```{r}
+flexdashboard::renderValueBox({
+  req(bib())
+  week <- as.integer(input$week)
+  data <- bib()
+  x <- data$Consommations.predites[week]/ data$Impact.climatique.des.DJU..kwh.[week]*(data$Impact.climatique.des.DJU..kwh.[week] - 1)/(data$Tendance.de.consommation..kwh.[week])
+  flexdashboard::valueBox(
+    value =  ifelse( abs(x) >10000,
+                     format(round(x/1000), big.mark = " ",digits = 0) %>%  
+                       paste0(' MWh'),
+                     format(x, big.mark = " ",digits = 0) %>%
+                       paste0(' KWh')),
+    icon = "fa-bolt",color = "info"
+  )
+})
+```
+
+
